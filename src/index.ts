@@ -73,7 +73,7 @@ export {
   registerAllSavedWorkflows,
   registerSavedWorkflow,
 } from "./saved-commands.js";
-export { createSharedStoreTools, SharedStore } from "./shared-store.js";
+export { SharedStore } from "./shared-store.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
@@ -95,6 +95,31 @@ export type {
   WorkflowRunResult,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export type {
+  AlignmentEvidence,
+  CapabilityDescriptor,
+  CapabilityDiagnostic,
+  DynamicReferenceDescriptor,
+  OptionDescriptor,
+  OptionShape,
+  PresentAtVersion,
+  RuntimeBindingAssembly,
+  StaticCapabilityFact,
+  WorkflowCapabilityContract,
+  WorkflowCapabilityDefinition,
+  WorkflowRuntimeImplementations,
+} from "./workflow-capability-contract.js";
+export {
+  CapabilityClassification,
+  CapabilityOrigin,
+  CapabilitySupport,
+  DiagnosticSeverity,
+  DiscoveryPlacement,
+  defineWorkflowCapabilityContract,
+  WORKFLOW_CAPABILITY_CONTRACT,
+  WORKFLOW_CAPABILITY_DEFINITION,
+  WorkflowCapabilityContractError,
+} from "./workflow-capability-contract.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type {
   WorkflowControlInput,
@@ -103,17 +128,15 @@ export type {
 } from "./workflow-control-tool.js";
 export { createWorkflowControlTool } from "./workflow-control-tool.js";
 export {
+  type ArmReason,
+  buildArmedWorkflowPrompt,
   buildForcedWorkflowPrompt,
-  colorizeWorkflow,
   endsWithTrigger,
   hasTrigger,
-  type InstallWorkflowEditorOptions,
-  installWorkflowEditor,
-  RAINBOW,
+  type InstallWorkflowKeywordArmingOptions,
+  installWorkflowKeywordArming,
   registerWorkflowProgressCommands,
   registerWorkflowTriggerCommand,
-  tokenizeAnsi,
-  WorkflowEditor,
   type WorkflowModeState,
 } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";

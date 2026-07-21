@@ -72,20 +72,32 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   const tool = createWorkflowControlTool({ manager });
 
   assert.equal(tool.name, "workflow_control");
+
+  // The top-level parameter schema MUST be `type: "object"`. A discriminated
+  // Type.Union serialized to a top-level `anyOf` with no `type`, which strict
+  // providers (DeepSeek) reject with "schema must be type object, got type:
+  // null" — a 400 on every request. This is the regression guard for that.
+  assert.equal((tool.parameters as { type?: string }).type, "object");
+
+  // Schema level: every valid action verb is accepted; runId is optional at the
+  // schema level (the per-action requirement is enforced by prepareArguments).
   assert.equal(Check(tool.parameters, { action: "list" }), true);
   assert.equal(Check(tool.parameters, { action: "status", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "pause", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "resume", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
+  assert.equal(Check(tool.parameters, { action: "status" }), true, "runId is optional at the schema level");
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 2 }), false);
-  assert.equal(Check(tool.parameters, { action: "status" }), false);
-  assert.equal(Check(tool.parameters, { action: "list", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "status", runId: "abc", extra: true }), false);
 
+  // prepareArguments (normalizeInput) enforces the real per-action rules that the
+  // permissive object schema deliberately leaves open.
   const prepare = tool.prepareArguments as (value: unknown) => unknown;
   assert.throws(() => prepare({ action: "pause" }), /requires runId/);
+  assert.throws(() => prepare({ action: "status" }), /requires runId/);
+  assert.throws(() => prepare({ action: "list", runId: "abc" }), /does not accept runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
 });
@@ -169,6 +181,59 @@ test("pause, resume, and stop call the shared manager lifecycle methods", async 
     fixture.calls.map((call) => call.action),
     ["pause", "resume", "stop"],
   );
+});
+
+test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {
+  // Regression guard for the workflow_control "stop" bug: findRun() resolves
+  // candidates from manager.listRuns() (disk-backed), so a run persisted as
+  // "paused" by a prior pi session — never loaded into the manager's
+  // in-memory map — is still advertised with "stop" as an allowed action.
+  // Before the fix, manager.stop() only checked its in-memory map and
+  // returned false for such a run, so the tool reported invalidTransition
+  // even though "stop" was just advertised as allowed.
+  const coldRun = run("paused", "cold-restart-1");
+  const runs = new Map([[coldRun.runId, coldRun]]);
+  const manager = {
+    listRuns: () => [...runs.values()],
+    getSnapshot: () => null,
+    pause: () => false,
+    async resume() {
+      return false;
+    },
+    stop(runId: string) {
+      // Mirrors the real WorkflowManager.stop() persisted fallback: not in
+      // memory, but persisted status is stoppable, so it succeeds.
+      const item = runs.get(runId);
+      if (!item || (item.status !== "running" && item.status !== "paused")) return false;
+      item.status = "aborted";
+      return true;
+    },
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, { action: "stop", runId: "cold-restart-1" });
+  assert.match(text(response), /^action=stop result=stopped /);
+  assert.equal(response.details.result, "stopped");
+  assert.doesNotMatch(text(response), /invalidTransition|cannot stop/);
+});
+
+test("a thrown error from the manager during an action is reported as a structured error, not a raw throw", async () => {
+  const throwingRun = run("paused", "throws-1");
+  const manager = {
+    listRuns: () => [throwingRun],
+    getSnapshot: () => null,
+    pause: () => false,
+    async resume() {
+      return false;
+    },
+    stop() {
+      throw new Error("disk I/O failed");
+    },
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, { action: "stop", runId: "throws-1" });
+  assert.match(text(response), /^action=stop result=error runId=throws-1 error=disk I\/O failed/);
+  assert.equal(response.details.result, "error");
+  assert.equal(response.details.error, "disk I/O failed");
 });
 
 test("unknown IDs and illegal transitions return explicit errors with allowed actions", async () => {

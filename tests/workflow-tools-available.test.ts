@@ -2,7 +2,7 @@
  * Tests for tools availability when workflows mode is triggered.
  *
  * The bug: when a user message contains "workflow" (trigger keyword),
- * installWorkflowEditor's input handler calls:
+ * installWorkflowKeywordArming's input handler calls:
  *   pi.setActiveTools?.([WORKFLOW_TOOL_NAME]);
  * which restricts ALL tools to ONLY the workflow tool.
  * The model then cannot use read, bash, edit, write, web_search, etc.
@@ -18,8 +18,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { handoffWorkflowRuntime, takeWorkflowRuntime } from "../src/extension-reload.js";
+import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
@@ -79,25 +80,16 @@ function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: 
 }
 
 // ---------------------------------------------------------------------------
-// Test: installWorkflowEditor keeps default tools available
+// Test: installWorkflowKeywordArming keeps default tools available
 // ---------------------------------------------------------------------------
 
-describe("installWorkflowEditor - tool availability", () => {
+describe("installWorkflowKeywordArming - tool availability", () => {
   it("should include default Pi tools when input handler fires with 'workflow'", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi([...DEFAULT_PI_TOOLS]);
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     // Simulate user submitting a message with "workflow" keyword
     const inputHandlers = mockPi.handlers.input;
@@ -112,7 +104,7 @@ describe("installWorkflowEditor - tool availability", () => {
     // Verify transform result
     assert.deepEqual(result, {
       action: "transform",
-      text: buildForcedWorkflowPrompt("przetestuj to workflow zadanie"),
+      text: buildArmedWorkflowPrompt("przetestuj to workflow zadanie"),
     });
 
     // Verify getActiveTools was called
@@ -143,22 +135,13 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should restore original tools on turn_end", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     // Add a bonus tool to simulate a plugin adding a tool
     const originalTools = ["bash", "read", "edit", "write", "custom-plugin-tool", "workflow", "workflow_control"];
     const mockPi = createMockPi(originalTools);
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     // Trigger input with "workflows"
     const inputHandlers = mockPi.handlers.input;
@@ -186,16 +169,11 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should fire for a configured trigger word but not the default word", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
+    installWorkflowKeywordArming(
       mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
       undefined,
       testSettingsOptions(true, "pi-workflow"),
     );
@@ -210,20 +188,11 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it('should not fire for "/workflows" (slash command, not trigger)', async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     // Simulate user submitting a slash command
     const inputHandlers = mockPi.handlers.input;
@@ -240,20 +209,11 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should not fire for non-interactive sources", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     const inputHandlers = mockPi.handlers.input;
     const result = inputHandlers[0]({
@@ -266,20 +226,11 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should not fire for empty text", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     const inputHandlers = mockPi.handlers.input;
     const result = inputHandlers[0]({
@@ -292,22 +243,13 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should handle getActiveTools returning undefined gracefully", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     // Pi may not have getActiveTools in some hosts
     const mockPi = createMockPi();
     mockPi.getActiveTools = mock.fn(() => undefined as unknown as string[]);
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     const inputHandlers = mockPi.handlers.input;
     assert.doesNotThrow(() => {
@@ -319,23 +261,14 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should handle setActiveTools throwing gracefully (best-effort)", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
     mockPi.setActiveTools = mock.fn(() => {
       throw new Error("host rejected tool restriction");
     });
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     const inputHandlers = mockPi.handlers.input;
     // Should not throw — the catch block handles it
@@ -349,21 +282,12 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should handle multiple trigger events and restore correctly", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const originalTools = ["bash", "read", "edit", "write"];
     const mockPi = createMockPi(originalTools);
 
-    const ui = {
-      setEditorComponent: mock.fn(),
-    };
-
-    installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
+    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     // First trigger
     const inputHandlers = mockPi.handlers.input;
@@ -392,17 +316,11 @@ describe("installWorkflowEditor - tool availability", () => {
   });
 
   it("should work with different keyword variations: 'workflow', 'workflows', 'WORKFLOW'", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     for (const keyword of ["workflow", "workflows", "WORKFLOW", "WorkFlows"]) {
       const mockPi = createMockPi();
-      const ui = { setEditorComponent: mock.fn() };
-      installWorkflowEditor(
-        mockPi as unknown as ExtensionAPI,
-        ui as unknown as ExtensionUIContext,
-        undefined,
-        testSettingsOptions(),
-      );
+      installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
       mockPi.setActiveTools.mock.resetCalls();
 
@@ -419,34 +337,13 @@ describe("installWorkflowEditor - tool availability", () => {
     }
   });
 
-  it("should set editor component", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-    const setEditorComponent = mock.fn();
-    const ui = { setEditorComponent };
-
-    const state = installWorkflowEditor(
-      mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
-      undefined,
-      testSettingsOptions(),
-    );
-
-    assert.equal(setEditorComponent.mock.callCount(), 1);
-    assert.ok(state, "should return a WorkflowModeState");
-    assert.equal(state.active, false);
-  });
-
   it("should return correct WorkflowModeState", async () => {
-    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
-    const ui = { setEditorComponent: mock.fn() };
 
-    const state: WorkflowModeState = installWorkflowEditor(
+    const state: WorkflowModeState = installWorkflowKeywordArming(
       mockPi as unknown as ExtensionAPI,
-      ui as unknown as ExtensionUIContext,
       undefined,
       testSettingsOptions(),
     );
@@ -457,7 +354,7 @@ describe("installWorkflowEditor - tool availability", () => {
 });
 
 describe("workflow extension - control tool availability", () => {
-  it("registers and activates workflow and workflow_control together", async () => {
+  it("registers both control tools and hands the live runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
@@ -492,15 +389,34 @@ describe("workflow extension - control tool availability", () => {
             sessionManager: { getSessionId: () => "session-1" },
             ui: {
               setWidget: () => {},
-              getEditorComponent: () => undefined,
-              setEditorComponent: () => {},
             },
           },
         );
 
         assert.ok(activeTools.includes("workflow"));
         assert.ok(activeTools.includes("workflow_control"));
-        handlers.session_shutdown?.[0]?.();
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
+        staged.effort.level = "high";
+        handoffWorkflowRuntime(staged);
+
+        const secondHandlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const secondPi = {
+          ...pi,
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!secondHandlers[event]) secondHandlers[event] = [];
+            secondHandlers[event].push(handler);
+          },
+        } as unknown as ExtensionAPI;
+        installExtension(secondPi);
+        assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");
+
+        secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+        const restaged = takeWorkflowRuntime(process.cwd());
+        assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
+        assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
       });
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });

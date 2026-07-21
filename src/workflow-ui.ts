@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
-import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
+import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
@@ -36,12 +36,6 @@ const STATUS_ICON: Record<string, string> = {
   aborted: "⊘",
   skipped: "⊘",
 };
-
-/** Minimal theme surface so rendering is testable without the real Theme class. */
-export interface ThemeLike {
-  fg(color: string, text: string): string;
-  bold(text: string): string;
-}
 
 const PLAIN: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
@@ -86,10 +80,42 @@ interface AgentRow {
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
+/**
+ * Coerce a possibly-non-string value from a (corrupt) persisted run to a string,
+ * so it can never reach a downstream truncateToWidth()/visibleWidth() as a
+ * non-string and crash the whole /workflows overlay via text.slice() (#110).
+ * Applied at every Model read boundary that feeds the renderer: phase titles,
+ * agent labels/phases, and run names.
+ */
+function asText(v: unknown): string {
+  return typeof v === "string" ? v : String(v ?? "");
+}
+
+/** The (coerced) phase an agent belongs to; "(no phase)" when unset. Shared by
+ *  agents()/agentsByPhase() so grouping and the drilled-in filter always agree. */
+function agentPhaseKey(a: WorkflowAgentSnapshot): string {
+  return a.phase != null ? asText(a.phase) : "(no phase)";
+}
+
+/** Build a render-safe AgentRow: coerce label/phase so a non-string value from a
+ *  corrupt run can't crash the agent row's truncateToWidth() (#110). */
+function toAgentRow(a: WorkflowAgentSnapshot): AgentRow {
+  return {
+    id: a.id,
+    label: asText(a.label),
+    status: a.status,
+    phase: a.phase != null ? asText(a.phase) : a.phase,
+    tokens: a.tokens,
+    tokenUsage: a.tokenUsage,
+    model: a.model,
+  };
+}
+
 export function shortModel(model: string | undefined): string | undefined {
   if (!model) return undefined;
-  const slash = model.indexOf("/");
-  return slash > 0 ? model.slice(slash + 1) : model;
+  const m = asText(model);
+  const slash = m.indexOf("/");
+  return slash > 0 ? m.slice(slash + 1) : m;
 }
 
 /** Reads run/phase/agent data from the manager, preferring live snapshots. */
@@ -110,7 +136,11 @@ export class NavigatorModel {
   runs(): RunRow[] {
     return this.manager.listRuns().map((p) => {
       const live = this.manager.getRun(p.runId);
-      const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
+      // Array guard (#110): a structurally corrupt persisted run (agents not an
+      // array) would otherwise throw "agents is not iterable" here and crash the
+      // runs list itself — i.e. /workflows would fail to open at all.
+      const rawAgents = live?.snapshot.agents ?? p.agents;
+      const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
       // The run-level aggregate is authoritative but only lands when the run
       // ends; per-agent figures update live. Use whichever accounts for more
@@ -122,7 +152,7 @@ export class NavigatorModel {
         fromAgents.fresh + fromAgents.cacheRead > fromUsage.fresh + fromUsage.cacheRead ? fromAgents : fromUsage;
       return {
         runId: p.runId,
-        name: live?.snapshot.name ?? p.workflowName,
+        name: asText(live?.snapshot.name ?? p.workflowName),
         status: live?.status ?? p.status,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
@@ -146,20 +176,29 @@ export class NavigatorModel {
   }
 
   runName(runId: string): string {
-    return this.snapshot(runId)?.snapshot.name ?? runId;
+    return asText(this.snapshot(runId)?.snapshot.name ?? runId);
   }
 
   runStatus(runId: string): string {
-    return this.snapshot(runId)?.status ?? "unknown";
+    // Coerce (#110): a corrupt persisted run can carry a non-string status, which
+    // would otherwise crash twoPaneHeader's truncateToWidth() with text.slice().
+    return asText(this.snapshot(runId)?.status ?? "unknown");
   }
 
   phases(runId: string): PhaseRow[] {
     const snap = this.snapshot(runId)?.snapshot;
     if (!snap) return [];
-    const order = snap.phases.length ? [...snap.phases] : [];
+    // Coerce phase keys up front (#110): a non-string phase — from a corrupt
+    // persisted run or a script that passed a non-string to phase() — would
+    // otherwise reach truncateToWidth() and crash the overlay. Grouping through
+    // the shared agentPhaseKey() (not an inline copy) locks the invariant that
+    // agents land under the same string the drilled-in agents() filter compares
+    // against; the Array.isArray guards mirror agents()/agentsByPhase().
+    const order = Array.isArray(snap.phases) ? snap.phases.map(asText) : [];
     const byPhase = new Map<string, AgentRow[]>();
-    for (const a of snap.agents) {
-      const key = a.phase ?? "(no phase)";
+    const agents = Array.isArray(snap.agents) ? snap.agents : [];
+    for (const a of agents) {
+      const key = agentPhaseKey(a);
       if (!byPhase.has(key)) byPhase.set(key, []);
       byPhase.get(key)?.push(a);
       if (!order.includes(key)) order.push(key);
@@ -168,7 +207,7 @@ export class NavigatorModel {
       const agents = byPhase.get(title) ?? [];
       const usage = aggregateAgentUsage(agents);
       return {
-        title,
+        title, // already coerced to a string above
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
         fresh: usage.fresh,
@@ -179,18 +218,30 @@ export class NavigatorModel {
 
   agents(runId: string, phase: string): AgentRow[] {
     const snap = this.snapshot(runId)?.snapshot;
-    if (!snap) return [];
-    return snap.agents
-      .filter((a) => (a.phase ?? "(no phase)") === phase)
-      .map((a) => ({
-        id: a.id,
-        label: a.label,
-        status: a.status,
-        phase: a.phase,
-        tokens: a.tokens,
-        tokenUsage: a.tokenUsage,
-        model: a.model,
-      }));
+    if (!snap || !Array.isArray(snap.agents)) return [];
+    return snap.agents.filter((a) => agentPhaseKey(a) === phase).map((a) => toAgentRow(a));
+  }
+
+  /**
+   * All agents grouped by their (coerced) phase in a SINGLE pass — O(agents).
+   * The navigator's phase pane needs each phase's agents (status colour + the
+   * selected phase's rows); calling agents() once per phase row was O(phases ×
+   * agents) per frame. Callers that render every phase use this instead.
+   */
+  agentsByPhase(runId: string): Map<string, AgentRow[]> {
+    const out = new Map<string, AgentRow[]>();
+    const snap = this.snapshot(runId)?.snapshot;
+    if (!snap || !Array.isArray(snap.agents)) return out;
+    for (const a of snap.agents) {
+      const key = agentPhaseKey(a);
+      let arr = out.get(key);
+      if (!arr) {
+        arr = [];
+        out.set(key, arr);
+      }
+      arr.push(toAgentRow(a));
+    }
+    return out;
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -208,12 +259,15 @@ type StackFrame = {
 };
 
 function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
+  // Array guards (#110): a structurally corrupt persisted run (phases/logs/agents
+  // not arrays) would otherwise throw when mapped/spread and crash the overlay.
+  const agents = Array.isArray(p.agents) ? p.agents : [];
   return {
-    name: p.workflowName,
-    phases: p.phases,
+    name: asText(p.workflowName),
+    phases: Array.isArray(p.phases) ? p.phases : [],
     currentPhase: p.currentPhase,
-    logs: p.logs,
-    agents: p.agents.map((a) => ({
+    logs: Array.isArray(p.logs) ? p.logs : [],
+    agents: agents.map((a) => ({
       id: a.id,
       label: a.label,
       phase: a.phase,
@@ -229,10 +283,10 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       tokenUsage: a.tokenUsage,
       model: a.model,
     })),
-    agentCount: p.agents.length,
-    runningCount: p.agents.filter((a) => a.status === "running").length,
-    doneCount: p.agents.filter((a) => a.status === "done").length,
-    errorCount: p.agents.filter((a) => a.status === "error").length,
+    agentCount: agents.length,
+    runningCount: agents.filter((a) => a.status === "running").length,
+    doneCount: agents.filter((a) => a.status === "done").length,
+    errorCount: agents.filter((a) => a.status === "error").length,
     tokenUsage: p.tokenUsage ? { ...p.tokenUsage } : undefined,
     runId: p.runId,
   };
@@ -599,13 +653,18 @@ function renderPhasesAgents(
   bodyCap: number,
 ): string[] {
   const phases = model.phases(runId);
+  // Group agents by phase ONCE per frame (O(agents)). leftPhaseRow needs each
+  // visible phase's agents (status colour) and the selected phase's agents drive
+  // the right pane; calling model.agents() per phase row was O(phases × agents).
+  const agentsByPhase = model.agentsByPhase(runId);
+  const agentsOf = (title: string): AgentRow[] => agentsByPhase.get(title) ?? [];
   // Which phase is selected drives the right pane. In "phases" view it's the
   // cursor; in "agents" view it's the drilled-in phase (state.phase).
   const inAgents = state.kind === "agents";
   let selPhaseIdx = inAgents ? phases.findIndex((p) => p.title === state.phase) : state.cursor;
   if (selPhaseIdx < 0) selPhaseIdx = 0;
   const selPhase = phases[selPhaseIdx];
-  const agents = selPhase ? model.agents(runId, selPhase.title) : [];
+  const agents = selPhase ? agentsOf(selPhase.title) : [];
 
   // Narrow-terminal degrade: single pane (spec §7.1).
   if (width < LW_MIN + RW_MIN - 1) {
@@ -632,7 +691,7 @@ function renderPhasesAgents(
     }
     const p = phases[idx];
     const selected = !inAgents && idx === state.cursor;
-    const ag = model.agents(runId, p.title);
+    const ag = agentsOf(p.title);
     let row = leftPhaseRow(p, idx, selected, ag, leftInner, theme);
     if (k === bodyRows - 1 && leftRows.more) {
       row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), leftInner, "", true);
@@ -823,19 +882,26 @@ export function renderNavigator(
     const a = model.agentDetail(state.runId, state.agentId);
     lines.push(theme.bold(a ? a.label : "agent"));
     if (a) {
+      // Coerce every dynamic value before wrap() (#110): a non-string prompt is
+      // reachable even from a LIVE run — agent(42) in a model-written script is
+      // never type-checked — and would crash wrap()'s text.split(). Persisted
+      // error/status/history text can be non-string on a corrupt run too.
       const body: string[] = [];
-      body.push(dim("Status: ") + (a.status ?? ""));
+      body.push(dim("Status: ") + asText(a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
-      if (a.error) body.push(dim("Error: ") + a.error);
+      if (a.error) body.push(dim("Error: ") + asText(a.error));
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
-      body.push(...wrap(a.prompt ?? "", width));
+      body.push(...wrap(asText(a.prompt ?? ""), width));
       body.push("", dim("Result:"));
-      body.push(...wrap(a.resultPreview ?? "(none)", width));
+      body.push(...wrap(asText(a.resultPreview ?? "(none)"), width));
       if (a.history?.length) {
         body.push("", dim("History:"));
         for (const entry of a.history) {
-          body.push(...wrap(`${historyLabel(entry)}: ${entry.text}`, width));
+          // Skip a null/primitive element from a corrupt persisted history —
+          // historyLabel() reads entry.kind and would throw on it (#110).
+          if (!entry || typeof entry !== "object") continue;
+          body.push(...wrap(`${historyLabel(entry)}: ${asText(entry.text)}`, width));
         }
       }
       pushScrollable(body);
@@ -846,12 +912,13 @@ export function renderNavigator(
     lines.push(theme.bold(w ? w.name : "saved workflow"));
     if (w) {
       const body: string[] = [];
-      if (w.description) body.push(dim("Description: ") + w.description);
+      if (w.description) body.push(dim("Description: ") + asText(w.description));
       body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
-      body.push(dim("Saved at: ") + w.savedAt);
+      body.push(dim("Saved at: ") + asText(w.savedAt));
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
       body.push("", dim("Script:"));
-      body.push(...wrap(w.script, width));
+      // Coerce (#110): corrupt saved-workflow JSON can carry a non-string script.
+      body.push(...wrap(asText(w.script), width));
       pushScrollable(body);
     }
   }
@@ -1038,91 +1105,112 @@ export function openWorkflowNavigator(
       const act = (data: string) => {
         const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
         const action = keyToAction(parseKey(data), state.kind, itemKind);
-        switch (action.type) {
-          case "move":
-            state.move(action.delta, currentCount(state, model));
-            break;
-          case "drill":
-            state.drill(model);
-            break;
-          case "back":
-            if (!state.back()) {
+        // Single error boundary around the whole dispatch: any case here can call
+        // into manager/storage methods that throw synchronously on bad on-disk
+        // state (corrupt persisted scripts, EACCES/ENOSPC, a stale run lease) —
+        // uncaught, that would crash/freeze this TUI overlay's input handler,
+        // which has no boundary of its own (#330 audit). A per-case try/catch
+        // (see "restart" below) can still add a friendlier, action-specific
+        // message; this is the backstop for every other case, present and future.
+        try {
+          switch (action.type) {
+            case "move":
+              state.move(action.delta, currentCount(state, model));
+              break;
+            case "drill":
+              state.drill(model);
+              break;
+            case "back":
+              if (!state.back()) {
+                cleanup();
+                done(undefined);
+              }
+              break;
+            case "close":
               cleanup();
               done(undefined);
-            }
-            break;
-          case "close":
-            cleanup();
-            done(undefined);
-            return;
-          case "deleteSaved": {
-            if (state.kind === "runs") {
-              const saved = model.saved();
-              const runCount = model.runs().length;
-              const item = saved[state.cursor - runCount];
-              if (item) {
-                model.deleteSaved(item.name);
-                ui.notify(`Deleted /${item.name}`, "info");
+              return;
+            case "deleteSaved": {
+              if (state.kind === "runs") {
+                const saved = model.saved();
+                const runCount = model.runs().length;
+                const item = saved[state.cursor - runCount];
+                if (item) {
+                  model.deleteSaved(item.name);
+                  ui.notify(`Deleted /${item.name}`, "info");
+                }
+              } else if (state.kind === "savedDetail" && state.savedName) {
+                model.deleteSaved(state.savedName);
+                ui.notify(`Deleted /${state.savedName}`, "info");
+                state.back();
               }
-            } else if (state.kind === "savedDetail" && state.savedName) {
-              model.deleteSaved(state.savedName);
-              ui.notify(`Deleted /${state.savedName}`, "info");
-              state.back();
-            }
-            break;
-          }
-          case "pause": {
-            const id = state.activeRunId(model);
-            if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
-            break;
-          }
-          case "stop": {
-            const id = state.activeRunId(model);
-            if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
-            break;
-          }
-          case "restart": {
-            const id = state.activeRunId(model);
-            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-            if (!run?.script) {
-              ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
               break;
             }
-            const { runId: newId } = manager.startInBackground(run.script, run.args);
-            ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
-            break;
-          }
-          case "save": {
-            const id = state.activeRunId(model);
-            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-            if (!run?.script) {
-              ui.notify("No saved run script to save", "warning");
-            } else if (!opts.storage) {
-              ui.notify("Saving is not available (no storage)", "error");
-            } else {
-              const storage = opts.storage;
-              const name = run.workflowName || "workflow";
-              let saved: ReturnType<WorkflowStorage["save"]>;
-              try {
-                saved = storage.save({
-                  name,
-                  description: run.workflowName,
-                  script: run.script,
-                  location: "project",
-                });
-              } catch (error) {
-                ui.notify(error instanceof Error ? error.message : String(error), "error");
+            case "pause": {
+              const id = state.activeRunId(model);
+              if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
+              break;
+            }
+            case "stop": {
+              const id = state.activeRunId(model);
+              if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+              break;
+            }
+            case "restart": {
+              const id = state.activeRunId(model);
+              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+              if (!run?.script) {
+                ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                 break;
               }
-              registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
-                storage.list().some((w) => w.name === saved.name),
-              );
-              ui.notify(`Saved /${name}`, "info");
+              try {
+                const { runId: newId } = manager.startInBackground(run.script, run.args);
+                ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+              } catch (error) {
+                ui.notify(
+                  `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
+                  "error",
+                );
+              }
+              break;
             }
-            break;
+            case "save": {
+              const id = state.activeRunId(model);
+              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+              if (!run?.script) {
+                ui.notify("No saved run script to save", "warning");
+              } else if (!opts.storage) {
+                ui.notify("Saving is not available (no storage)", "error");
+              } else {
+                const storage = opts.storage;
+                const name = run.workflowName || "workflow";
+                let saved: ReturnType<WorkflowStorage["save"]>;
+                try {
+                  saved = storage.save({
+                    name,
+                    description: run.workflowName,
+                    script: run.script,
+                    location: "project",
+                  });
+                } catch (error) {
+                  ui.notify(error instanceof Error ? error.message : String(error), "error");
+                  break;
+                }
+                registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
+                  storage.list().some((w) => w.name === saved.name),
+                );
+                ui.notify(`Saved /${name}`, "info");
+              }
+              break;
+            }
+            default:
+              return;
           }
-          default:
-            return;
+        } catch (error) {
+          ui.notify(
+            `Workflow action "${action.type}" failed: ${error instanceof Error ? error.message : error}`,
+            "error",
+          );
         }
         rerender();
       };

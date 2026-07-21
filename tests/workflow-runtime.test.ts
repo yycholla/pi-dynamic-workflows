@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -345,6 +345,7 @@ test("resume replays cached results without re-running agents", async () => {
   const r1 = await runWorkflow(resumeScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "resume-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 2);
@@ -358,7 +359,8 @@ test("resume replays cached results without re-running agents", async () => {
   const r2 = await runWorkflow(resumeScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "resume-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 0, "no live runs on a full cache hit");
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
@@ -370,6 +372,7 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   await runWorkflow(resumeScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "resume-run-2",
     onAgentJournal: (e) => journal.push(e),
   });
 
@@ -378,7 +381,8 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   await runWorkflow(editedScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "resume-run-2",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 1, "only the edited call re-runs");
 });
@@ -395,6 +399,7 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
   await runWorkflow(threeCallScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "prefix-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 3);
@@ -407,7 +412,8 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
   await runWorkflow(editedScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
 });
@@ -427,6 +433,7 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   await runWorkflow(script("x"), {
     agent: first.runner,
     persistLogs: false,
+    runId: "par-prefix-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 3);
@@ -435,7 +442,8 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   await runWorkflow(script("x-edited"), {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "par-prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
 });
@@ -497,6 +505,60 @@ return { err }`;
   assert.match(result.result.err, /one level deep/);
 });
 
+test("sequential nested workflow() calls at the same depth get distinct child run ids (no cross-child id/deltaKey collision)", async () => {
+  // `shared.depth` alone would give BOTH of these sequential children the
+  // same `${runId}-nested1` suffix (depth returns to 0 between them, since
+  // only one level of nesting is ever live at a time) — and each child's own
+  // callSeq restarts at 0, so their first agent() calls would then compute
+  // the identical deltaKey (also used as the onAgentStart/onAgentEnd event
+  // id — see item 2's identity model), corrupting SharedStore deltas and
+  // misattributing events. child1's agent() call is deliberately left
+  // un-awaited — realistically, that's exactly when the collision bites:
+  // the stray can still be in SharedRuntime.inFlight (only the top-level
+  // frame drains, not each nested frame) when child2 starts and mints an id.
+  const seenIds = new Set<string>();
+  let duplicateId: string | undefined;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "child1-stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return "child1-stray-done";
+      }
+      return `ran:${prompt}`;
+    },
+  };
+  const scripts: Record<string, string> = {
+    child1: `export const meta = { name: 'child1', description: 'c1' }
+// Deliberately NOT awaited.
+agent('child1-stray', { label: 'stray' })
+return 'child1-done'`,
+    child2: `export const meta = { name: 'child2', description: 'c2' }
+const r = await agent('child2-live', { label: 'live' })
+return r`,
+  };
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const a = await workflow('child1')
+const b = await workflow('child2')
+return { a, b }`;
+
+  const result = await runWorkflow<{ a: string; b: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => scripts[name],
+    onAgentStart: (event) => {
+      if (seenIds.has(event.id)) duplicateId = event.id;
+      seenIds.add(event.id);
+    },
+  });
+  assert.equal(result.result.a, "child1-done");
+  assert.equal(result.result.b, "ran:child2-live");
+  assert.equal(
+    duplicateId,
+    undefined,
+    "child1's un-awaited stray and child2's live call must never share an id/deltaKey",
+  );
+});
+
 test("runWorkflow budget gates on accumulated tokens", async () => {
   const script = `export const meta = { name: 'budget_demo', description: 'budget' }
 const a = await agent('first', { label: 'a' })
@@ -511,6 +573,67 @@ return { a, second }`;
   });
 
   assert.equal(result.result.second, "blocked");
+});
+
+test("runWorkflow initialTokenUsage seeds the run-wide budget so it holds cumulatively across resume (#A2)", async () => {
+  // Simulates what WorkflowManager.resume() passes: a prior execution already
+  // spent 60 (persisted). This fresh execution's own SharedRuntime must start
+  // counting from there — 'a' (allowed: seeded 60 + budget 100 leaves 40
+  // headroom) then spends 60 more, landing at 120; 'b' must then be blocked,
+  // even though neither the seed alone (60) nor 'a' alone (60) would trip it.
+  const script = `export const meta = { name: 'seeded_budget', description: 'seed' }
+const a = await agent('a', { label: 'a' })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    tokenBudget: 100,
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.a, "ok", "'a' itself is allowed to run (remaining was 40 > 0 before it)");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'b' must be blocked once the seeded + this-run spend sums past the budget",
+  );
+  assert.equal(result.tokenUsage?.total, 120, "final total reflects the seed (60) plus 'a's spend (60); 'b' never ran");
+});
+
+test("runWorkflow initialTokenUsage integrates correctly with phase() sub-budgets (seeded baseline isn't corrupted)", async () => {
+  // phase()'s sub-budget deliberately re-bases from shared.spent AT the
+  // phase() call (see workflow.ts's phase(): "Re-declaring re-bases from the
+  // current spent"), so a seed doesn't make the phase's OWN ceiling trip any
+  // sooner than usual — it only shifts the visible baseline. This mirrors the
+  // existing "phase sub-budget throws..." test's budget/spend shape exactly,
+  // plus a seed, to confirm seeding doesn't corrupt that mechanism.
+  const script = `export const meta = { name: 'seeded_phase_budget', description: 'seed' }
+const spentAtStart = budget.spent()
+phase('noisy', { budget: 100 })
+let blocked = false
+await agent('a', { label: '1' })
+try { await agent('b', { label: '2' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { spentAtStart, blocked }`;
+
+  const result = await runWorkflow<{ spentAtStart: number; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    initialTokenUsage: { input: 40, output: 0, total: 40, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(
+    result.result.spentAtStart,
+    40,
+    "budget.spent() reflects the seed before any agent in this execution runs",
+  );
+  assert.equal(
+    result.result.blocked,
+    true,
+    "the phase sub-budget still gates normally on top of a seeded run-wide total",
+  );
 });
 
 test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
@@ -584,6 +707,105 @@ return xs`;
   );
 });
 
+test("a fan-out past maxAgents cancels queued agents instead of draining the reserved queue", async () => {
+  // A parallel() overshoot reserves and queues up to maxAgents agents behind the
+  // limiter. Before the fix, every reserved agent ran its real API call (spending)
+  // even though the fan-out had already rejected; now the breach short-circuits the
+  // still-queued agents so at most ~concurrency of them execute.
+  const fanout = 100;
+  const maxAgents = 50;
+  const concurrency = 4;
+  const calls = { count: 0 };
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const runner = {
+    async run(prompt: string) {
+      calls.count++;
+      await gate; // stay in-flight/queued while the limit breach propagates
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'c4', description: 'fanout cancel' }
+const xs = await parallel(Array.from({ length: ${fanout} }, (_, i) => () => agent('x' + i, { label: 'a' + i })))
+return xs`;
+  const run = runWorkflow(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
+  // The run now drains every in-flight agent() call (including these
+  // gate-blocked ones) before its own promise settles — see the run-fatal
+  // drain in runWorkflow's finally — so `run` will NOT reject until `gate`
+  // resolves. Release it concurrently instead of after awaiting the
+  // rejection (which would deadlock: nothing else ever calls release()).
+  const releaseSoon = new Promise<void>((r) => setTimeout(r, 20)).then(() => release());
+  await assert.rejects(run, /limit/i);
+  await releaseSoon;
+  // Deterministically exactly `concurrency`: the limiter runs the first
+  // `concurrency` submissions' bodies synchronously during the reservation
+  // pass (each immediately calls runner.run() and then suspends on `gate`);
+  // every submission after that suspends on the limiter's internal queue
+  // before it ever reaches runner.run(), and the batch is cancelled (via
+  // fanoutScope) before any of them get their turn.
+  assert.equal(calls.count, concurrency);
+});
+
+test("sibling parallel() batches are isolated: one breaching maxAgents does not cancel the other", async () => {
+  // Two independent parallel() fan-outs run CONCURRENTLY inside the same run
+  // (sharing one shared.agentCount / maxAgents), each isolated via its own
+  // .then(ok, err). Batch A (3 agents) never breaches; batch B (40 agents)
+  // does. Before batch-scoped cancellation, a run-global "limitReached" flag
+  // would wrongly cancel A's still-queued agents too, purely because B (an
+  // unrelated fan-out) breached the shared cap — that's the regression this
+  // guards against.
+  const maxAgents = 10;
+  const concurrency = 2;
+  const runner = {
+    async run(prompt: string) {
+      await new Promise((r) => setTimeout(r, 5));
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'sib', description: 'sibling isolation' }
+const batchA = parallel(Array.from({ length: 3 }, (_, i) => () => agent('a' + i, { label: 'a' + i })))
+  .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
+const batchB = parallel(Array.from({ length: 40 }, (_, i) => () => agent('b' + i, { label: 'b' + i })))
+  .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
+const [a, b] = await Promise.all([batchA, batchB])
+return { a, b }`;
+  const res = await runWorkflow<{
+    a: { ok: boolean; r?: unknown[] };
+    b: { ok: boolean; code?: string };
+  }>(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
+
+  assert.equal(res.result.a.ok, true, "batch A (never breaches) must resolve, not be cancelled by sibling B");
+  assert.equal(res.result.a.r?.length, 3);
+  assert.ok((res.result.a.r as unknown[]).every((r) => typeof r === "string" && r.startsWith("ran:")));
+
+  assert.equal(res.result.b.ok, false, "batch B (breaches maxAgents) must reject");
+  assert.equal(res.result.b.code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+});
+
+test("a breach in a nested parallel() doesn't corrupt the outer batch's state", async () => {
+  // Outer parallel() of two thunks; one thunk runs an inner parallel() that
+  // breaches a low maxAgents. The breach should propagate as a rejection of
+  // the whole run (agent limit is non-recoverable) without throwing anything
+  // unexpected (e.g. an ALS/ordering bug corrupting shared.agentCount).
+  const runner = {
+    async run(prompt: string) {
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'nest', description: 'nested fanout' }
+const xs = await parallel([
+  () => agent('outer-1', { label: 'outer-1' }),
+  () => parallel(Array.from({ length: 5 }, (_, i) => () => agent('inner' + i, { label: 'inner' + i }))),
+])
+return xs`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: runner, maxAgents: 2, concurrency: 2, persistLogs: false }),
+    /limit/i,
+  );
+});
+
 // ─── Additional edge case tests ─────────────────────────────────────────────────
 
 test("runWorkflow returns meta, logs, phases, and duration", async () => {
@@ -650,6 +872,31 @@ return results`;
   const result = await runWorkflow<string[]>(script, { agent, persistLogs: false });
   assert.ok(Array.isArray(result.result), "result.result should be an array");
   assert.equal(result.result.length, 2);
+});
+
+test("pipeline forwards a recoverable null to the next stage with original item and index", async () => {
+  const script = `export const meta = { name: 'pipeline_null', description: 'null forwarding' }
+const results = await pipeline(
+  ['alpha'],
+  (item) => agent('first ' + item, { label: 'first' }),
+  (previousValue, originalItem, index) => ({ previousValue, originalItem, index }),
+)
+return results`;
+  const agent = {
+    async run() {
+      throw new Error("recoverable first-stage failure");
+    },
+  };
+
+  const result = await runWorkflow<Array<{ previousValue: null; originalItem: string; index: number }>>(script, {
+    agent,
+    persistLogs: false,
+  });
+
+  assert.deepEqual(
+    Array.from(result.result, ({ previousValue, originalItem, index }) => ({ previousValue, originalItem, index })),
+    [{ previousValue: null, originalItem: "alpha", index: 0 }],
+  );
 });
 
 test("runWorkflow agent with different labels", async () => {
@@ -813,6 +1060,17 @@ test("parse-time guard rejects literal Date.now / Math.random / new Date()", asy
   }
 });
 
+test("parse-time guard preserves the source blocklist used by existing workflows", () => {
+  for (const forbidden of ["Date.now()", "Math.random()", "new Date()"]) {
+    const script = `export const meta = { name: 'blocked-prose', description: 'fixture' }
+// ${forbidden} is unavailable here.
+const warning = ${JSON.stringify(`Do not call ${forbidden}`)}
+return { warning }`;
+
+    assert.throws(() => parseWorkflowScript(script), /deterministic|unavailable/i);
+  }
+});
+
 test("runtime guard neuters computed-access bypasses the parse regex misses", async () => {
   const r1 = await probe('Math["random"]()');
   assert.match(r1.result.err ?? "", /unavailable|resume/i, 'Math["random"]() should throw at runtime');
@@ -853,4 +1111,212 @@ return { escaped, arr, j, s }`;
   // ({}).constructor.constructor is the vm Function; its code runs in the vm realm
   // where Date.now is neutered -> blocked (the old host-object escape is closed).
   assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
+});
+
+// ── Run-fatal abort: a non-recoverable error that will fail the whole run
+// must stop in-flight siblings from continuing to spend, while preserving
+// parallel()'s null-on-recoverable-error contract and a script's own
+// try/catch around agent()/parallel(). ──
+
+/** An agent runner whose in-flight calls actually respect an abort signal. */
+function abortAwareAgent(delayMs: number) {
+  const state = { started: 0, completed: 0, aborted: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        state.started++;
+        if (prompt === "failer") {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        }
+        return await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            state.completed++;
+            resolve(`done:${prompt}`);
+          }, delayMs);
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              state.aborted++;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+  };
+}
+
+test("a run-fatal error aborts in-flight parallel() siblings instead of letting them run to completion", async () => {
+  const { state, runner } = abortAwareAgent(200);
+  const script = `export const meta = { name: 'fatal_abort', description: 'sibling abort' }
+const xs = await parallel([
+  () => agent('failer', { label: 'failer' }),
+  () => agent('sib1', { label: 'sib1' }),
+  () => agent('sib2', { label: 'sib2' }),
+])
+return xs`;
+  await assert.rejects(runWorkflow(script, { agent: runner, persistLogs: false }), /boom/);
+  // Both in-flight siblings must have been aborted before their (200ms)
+  // delay would otherwise have let them complete and return a result.
+  assert.equal(state.started, 3, "all three agent() calls actually started");
+  assert.equal(state.aborted, 2, "both siblings were aborted once the run's fate was sealed");
+  assert.equal(state.completed, 0, "no sibling ran to completion on a run that's already failing");
+});
+
+test("a script's own try/catch around parallel() preserves in-flight siblings — no run-fatal abort", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  const script = `export const meta = { name: 'fatal_abort_caught', description: 'sibling survives caught failure' }
+let caught = false
+try {
+  await parallel([
+    () => agent('failer', { label: 'failer' }),
+    () => agent('sib1', { label: 'sib1' }),
+  ])
+} catch (e) {
+  caught = true
+}
+// A later agent() call must still work normally — the run's fate was never
+// sealed because the script caught parallel()'s escaping error.
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+  const result = await runWorkflow<{ caught: boolean; after: string }>(script, {
+    agent: runner,
+    persistLogs: false,
+  });
+  assert.equal(result.result.caught, true, "the script's own try/catch saw parallel()'s escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call still runs normally, unaborted");
+  assert.equal(state.aborted, 0, "the caught sibling was never aborted — the run's fate was never sealed");
+  assert.equal(state.completed, 2, "the caught sibling and the later agent() both ran to completion");
+});
+
+test("parallel()'s recoverable-error-to-null contract does not seal the run's fate (siblings unaffected)", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  // A plain (non-WorkflowError) throw from a thunk is classified recoverable by
+  // wrapError()'s default — parallel() must swallow it to null, not rethrow,
+  // and must NOT abort the sibling still in flight.
+  const script = `export const meta = { name: 'recoverable_null', description: 'recoverable swallowed' }
+const xs = await parallel([
+  () => { throw new Error('plain failure') },
+  () => agent('sib', { label: 'sib' }),
+])
+return xs`;
+  const result = await runWorkflow<Array<unknown>>(script, { agent: runner, persistLogs: false });
+  assert.deepEqual(result.result, [null, "done:sib"], "the thrown thunk resolves to null; the sibling still succeeds");
+  assert.equal(state.aborted, 0, "a recoverable, swallowed-to-null error must never trigger a run-fatal abort");
+  assert.equal(state.completed, 1);
+});
+
+test("a parent script that catches a nested workflow()'s uncaught child error can still run agents afterward (isTopLevelRun gate)", async () => {
+  // Only the TOP-level frame is allowed to seal shared.runFatalController (see
+  // isTopLevelRun in runWorkflow's catch) — a NESTED frame reaching its own
+  // catch must never seal it, because the error hasn't finished propagating
+  // yet: the parent script may still catch workflow()'s rejection and
+  // continue normally. If a nested frame sealed it too (the mutation this
+  // test targets — dropping the isTopLevelRun guard), the shared runtime
+  // (shared between parent and child via sharedRuntime) would already be
+  // aborted by the time control returns to the parent's catch block, so the
+  // parent's own SUBSEQUENT agent() call would be aborted before it could
+  // even start — even though the parent legitimately handled the failure.
+  const { state, runner } = abortAwareAgent(20);
+  const child = `export const meta = { name: 'child', description: 'c' }
+await agent('failer', { label: 'child-failer' })
+return 1`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+let caught = false
+try {
+  await workflow('child')
+} catch (e) {
+  caught = true
+}
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+
+  const result = await runWorkflow<{ caught: boolean; after: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+  assert.equal(result.result.caught, true, "the parent's own try/catch saw the child workflow's escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call must still run normally after the catch");
+  assert.equal(state.aborted, 0, "sealing at the child (nested) level must never abort the parent's own later agent");
+});
+
+// ── Un-awaited agent() calls must not outlive the run: the run drains every
+// spawned agent() call (awaited or not) before it is allowed to complete. ──
+
+test("an un-awaited agent() call is drained before the run completes", async () => {
+  let strayCompleted = false;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        strayCompleted = true;
+        return "stray-done";
+      }
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_demo', description: 'un-awaited agent' }
+// Deliberately NOT awaited — a script bug the run must tolerate without
+// letting this call outlive the run's completion.
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(result.result, "main-done");
+  assert.equal(strayCompleted, true, "the run must not complete until the un-awaited agent has settled");
+  assert.ok(
+    journal.some((e) => e.result === "stray-done"),
+    "the stray agent's completion must be journaled before the run ends",
+  );
+});
+
+test("an un-awaited agent() call replays deterministically from the journal on resume", async () => {
+  const calls = { stray: 0, main: 0 };
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        calls.stray++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "stray-done";
+      }
+      calls.main++;
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_resume_demo', description: 'un-awaited agent replay' }
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journalEntries = new Map<string, JournalEntry>();
+  const first = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    runId: "prior-run",
+    onAgentJournal: (entry) => journalEntries.set(`${entry.runId}:${entry.index}`, entry),
+  });
+  assert.equal(first.result, "main-done");
+  assert.equal(calls.stray, 1);
+  assert.equal(calls.main, 1);
+
+  const second = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    runId: "prior-run",
+    resumeJournal: journalEntries,
+    resumeFromRunId: "prior-run",
+  });
+  assert.equal(second.result, "main-done");
+  // Resume replays BOTH cached calls (including the un-awaited 'stray') from
+  // the journal — neither runner.run() is invoked again.
+  assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
+  assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });

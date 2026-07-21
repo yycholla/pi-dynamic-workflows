@@ -1,28 +1,12 @@
 /**
- * "Workflows mode" input affordance, à la a smart input box:
- *
- *  - While the editor text contains the bounded word `workflow`/`workflows`, those
- *    letters render as a flowing rainbow, signalling that submitting will engage a workflow.
- *  - Pressing Backspace immediately after such a word toggles the highlight OFF
- *    (the word stays, but turns plain white) — a non-destructive "don't run a
- *    workflow after all". Re-typing a fresh trigger word turns it back on.
- *  - When the highlight is ON at submit time, the user's message is transformed to
- *    instruct Pi to actually run the workflow tool.
- *
- * Implementation: we replace the core editor with a thin subclass of the exported
- * `CustomEditor` (which itself extends pi-tui's `Editor`), overriding only
- * `render()` (to colorize) and `handleInput()` (for the Backspace toggle). All
- * other editor behavior — history, autocomplete, paste, undo, multiline — is
- * inherited untouched.
+ * "Workflows mode" keyword trigger: while the submitted message contains the
+ * bounded word `workflow`/`workflows` (or a configured custom trigger word),
+ * the message is transformed at submit time to instruct Pi to actually run the
+ * workflow tool. Detection is purely textual (`event.text` on the `input`
+ * hook) — it does not depend on, or own, the host's editor component.
  */
 
-import {
-  CustomEditor,
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ExtensionUIContext,
-} from "@earendil-works/pi-coding-agent";
-import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_KEYWORD_TRIGGER_WORD, normalizeKeywordTriggerWord } from "./config.js";
 import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
 import {
@@ -50,12 +34,6 @@ function triggerRegex(triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD, flags = "iu", 
   return new RegExp(`${triggerSource(word)}${atEnd ? "$" : ""}`, flags);
 }
 
-/** 256-color ring cycling through the spectrum — shifted by a tick to "flow". */
-export const RAINBOW = [
-  196, 160, 202, 166, 208, 172, 214, 178, 220, 184, 226, 190, 118, 82, 46, 47, 48, 49, 50, 51, 45, 39, 33, 27, 21, 57,
-  93, 129, 165, 201, 198, 197,
-];
-
 export function hasTrigger(text: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
   return triggerRegex(triggerWord).test(text);
 }
@@ -72,347 +50,114 @@ export interface WorkflowModeState {
   suppressedKeywordText?: string;
 }
 
-export interface InstallWorkflowEditorOptions {
+export interface InstallWorkflowKeywordArmingOptions {
   settingsStore?: WorkflowSettingsStore;
 }
 
-interface AnsiToken {
-  esc?: string;
-  ch?: string;
-}
-
 /**
- * Split a rendered line into ANSI-escape tokens (passed through verbatim) and
- * single visible-character tokens. Handles CSI sequences (`\x1b[…m`, e.g. the
- * cursor's inverse-video) and APC/OSC string sequences (e.g. the zero-width
- * `CURSOR_MARKER` = `\x1b_pi:c\x07`) so colorization never corrupts them.
+ * Why a turn was armed. This is stated truthfully in the banner so the model
+ * isn't told "the trigger word you typed" on a path where no word was typed:
+ *  - "keyword": the user typed the configured workflow trigger word.
+ *  - "effort": standing `/effort` armed this turn (no workflow word was typed).
  */
-export function tokenizeAnsi(line: string): AnsiToken[] {
-  const tokens: AnsiToken[] = [];
-  let i = 0;
-  while (i < line.length) {
-    if (line[i] === "\x1b") {
-      let j = i + 1;
-      const next = line[j];
-      if (next === "[") {
-        // CSI: ends at a final byte in 0x40–0x7e.
-        j++;
-        while (j < line.length && !(line[j] >= "@" && line[j] <= "~")) j++;
-        j++;
-      } else if (next === "]" || next === "_" || next === "P" || next === "^") {
-        // String sequence: ends at BEL (\x07) or ST (\x1b\\).
-        j++;
-        while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
-        if (line[j] === "\x07") j++;
-        else if (line[j] === "\x1b") j += 2;
-      } else {
-        j++; // lone ESC + one byte
-      }
-      tokens.push({ esc: line.slice(i, j) });
-      i = j;
-    } else {
-      tokens.push({ ch: line[i] });
-      i++;
-    }
-  }
-  return tokens;
-}
+export type ArmReason = "keyword" | "effort";
 
 /**
- * Colorize every `workflow`/`workflows` occurrence in a rendered line with a
- * flowing rainbow, leaving all ANSI escapes (cursor, markers) intact. Returns the
- * line unchanged when it contains no trigger.
+ * Appended to the effort-path directive: standing `/effort` arms on every
+ * substantive message, so the model must be told it can decline the workflow on
+ * a conversational or trivial turn (mirrors "solo only on conversational turns").
  */
-export function colorizeWorkflow(
-  line: string,
-  tick: number,
-  palette: number[] = RAINBOW,
-  triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD,
-): string {
-  const tokens = tokenizeAnsi(line);
-  const visible = tokens
-    .filter((t) => t.ch !== undefined)
-    .map((t) => t.ch)
-    .join("");
-  if (!hasTrigger(visible, triggerWord)) return line;
+export const EFFORT_CONVERSATIONAL_ESCAPE =
+  "This turn was armed by standing effort mode, not by an explicit workflow request: if it is conversational or trivial, skip the workflow and just respond directly.";
 
-  const ranges: Array<[number, number]> = [];
-  const globalTrigger = triggerRegex(triggerWord, "giu");
-  for (let m = globalTrigger.exec(visible); m; m = globalTrigger.exec(visible)) {
-    ranges.push([m.index, m.index + m[0].length]);
-  }
-  const inRange = (idx: number) => ranges.some(([s, e]) => idx >= s && idx < e);
-
-  let out = "";
-  let vi = 0;
-  for (const t of tokens) {
-    if (t.esc !== undefined) {
-      out += t.esc;
-      continue;
-    }
-    if (inRange(vi)) {
-      const color = palette[(vi + tick) % palette.length];
-      // Reset only the foreground (39) afterwards so a surrounding inverse-video
-      // (the cursor) is preserved.
-      out += `\x1b[38;5;${color}m${t.ch}\x1b[39m`;
-    } else {
-      out += t.ch ?? "";
-    }
-    vi++;
-  }
-  return out;
+/** The one-line, truthful "why armed" clause for each heuristic arming path. */
+function armReasonClause(reason: ArmReason): string {
+  return reason === "keyword"
+    ? "you typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration"
+    : "standing effort mode armed this turn (you did not explicitly ask for a workflow)";
 }
-
-/** Backspace arrives as DEL (0x7f) or BS (0x08) depending on the terminal. */
-function isBackspace(data: string): boolean {
-  return data === "\x7f" || data === "\b";
-}
-
-/** Emitted at most once per process so a noisy host doesn't spam the log. */
-let warnedUnexpectedArity = false;
 
 /**
- * Pi's CustomEditor still forwards `(tui, theme, keybindings)` to the legacy
- * pi-tui Editor constructor. OMP's CustomEditor has no constructor and extends
- * the newer `Editor(theme)`. Select the argument layout from the base Editor's
- * required parameter count so one extension can run in either host.
+ * The #89 reassurance shared by every arming banner: a background run ENDING the
+ * turn is expected, not a stall — the result auto-delivers back — so the model
+ * shouldn't feel it must stay and block, nor avoid the tool to stay interactive.
+ * Names when `background:false` is the right call (user waiting inline).
+ */
+const BACKGROUND_DELIVERY_REASSURANCE =
+  "If you do call `workflow`, it runs in the background by default: this turn will end and the result is delivered back into the conversation automatically when it finishes — that's expected, not a stall, so you do not need to stay and block. Only pass background:false if the user is waiting for the result inline in this same turn.";
+
+/**
+ * The directive appended to a submitted message when workflows mode is ARMED by a
+ * HEURISTIC path — the keyword trigger or standing `/effort`. (The explicit
+ * `/workflows run` command uses {@link buildForcedWorkflowPrompt} instead.)
  *
- * `baseEditorCtor` defaults to the real `Editor` class (via
- * `Object.getPrototypeOf(CustomEditor)`) and is only overridable so unit tests
- * can exercise both branches without depending on which host's `CustomEditor`
- * happens to be installed (see `tests/workflow-editor.test.ts`).
+ * This authorizes — it does not force. Arming is a confirmed opt-in signal that
+ * lifts the always-on "do not call the tool" gate for THIS message; the model
+ * still decides whether the message is actually a request to do work (→ call the
+ * `workflow` tool) or just talk about workflows (→ answer directly). The old
+ * "You MUST / the ONLY acceptable action / Do NOT answer directly" forcing text
+ * caused two bugs: it over-triggered on messages that merely mention workflows
+ * (#88), and — by commanding the model to emit nothing but one `workflow` call
+ * and not talk — it produced a bare background run that ends the turn and leaves
+ * the user at an idle prompt (#89).
+ *
+ * The banner therefore (1) LEADS with the decision boundary (question/trivial →
+ * answer directly; a real decomposable request → call `workflow`) rather than
+ * leading with "call the tool"; (2) states the truthful opt-in `reason` for THIS
+ * path (no "the word you typed" on the effort path, where none was); and (3)
+ * carries the #89 background/deliver-back reassurance so an ending turn reads as
+ * expected. The how-to mechanics are NOT here — they live in the tool's static
+ * `description` (see createWorkflowTool), visible whenever the model looks at the
+ * tool, so they aren't re-injected per armed turn (#65).
+ *
+ * `extraDirective` (e.g. an effort-tier nudge + EFFORT_CONVERSATIONAL_ESCAPE) is
+ * appended when present.
  */
-export function customEditorConstructorArgs(
-  tui: TUI,
-  theme: EditorTheme,
-  keybindings: ConstructorParameters<typeof CustomEditor>[2],
-  baseEditorCtor: { readonly length: number } = Object.getPrototypeOf(CustomEditor) as { readonly length: number },
-): ConstructorParameters<typeof CustomEditor> {
-  if (baseEditorCtor.length === 1) {
-    // The installed Pi types describe the legacy signature; OMP provides the
-    // runtime-only `(theme, keybindings)` signature.
-    return [theme, keybindings] as unknown as ConstructorParameters<typeof CustomEditor>;
-  }
-  // INTENTIONAL: any arity other than exactly 1 is treated as the legacy
-  // 3-arg `(tui, theme, keybindings)` layout — this includes the expected
-  // legacy case (2: pi-tui's `Editor(tui, theme, options)`), but also any
-  // *unexpected* arity (0, 3, ...) from a host we haven't seen yet. That's a
-  // deliberate choice: legacy is the layout we've actually verified against
-  // real Pi releases, so it's the safer default. If a third host signature
-  // ever shows up, this heuristic needs a new branch — the warning below is
-  // meant to surface that instead of silently misconstructing the editor
-  // (see https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72).
-  if (baseEditorCtor.length !== 2 && !warnedUnexpectedArity) {
-    warnedUnexpectedArity = true;
-    console.warn(
-      `[pi-dynamic-workflows] WorkflowEditor: base editor constructor takes ${baseEditorCtor.length} required ` +
-        "argument(s), which is neither the known OMP layout (1) nor the known legacy Pi layout (2). Falling back " +
-        "to the legacy (tui, theme, keybindings) call — the editor may fail to render on this host. Please report " +
-        "this at https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72.",
-    );
-  }
-  return [tui, theme, keybindings];
+export function buildArmedWorkflowPrompt(
+  text: string,
+  opts: { reason?: ArmReason; extraDirective?: string } = {},
+): string {
+  const reason = opts.reason ?? "keyword";
+  const lines = [
+    text,
+    "",
+    "---",
+    "[workflows mode armed. Decide first: if this message is a question, a trivial task, or",
+    "just talk (about workflows, this repo, or the tool itself), answer it directly and stay",
+    "conversational — arming authorizes the tool, it does not force it. If it is a real,",
+    "decomposable request to do work, handle it by calling the `workflow` tool: write a script",
+    "that fans the task out across subagents via agent()/parallel()/pipeline().",
+    `Why this turn is armed: ${armReasonClause(reason)}.`,
+    BACKGROUND_DELIVERY_REASSURANCE + "]",
+  ];
+  if (opts.extraDirective) lines.push("", opts.extraDirective);
+  return lines.join("\n");
 }
 
 /**
- * Editor that paints the trigger words and owns the on/off toggle. Reads/writes
- * `state.active` so the extension's `input` handler can decide whether to force a
- * workflow at submit time.
- */
-export class WorkflowEditor extends CustomEditor {
-  private tick = 0;
-  private timer?: ReturnType<typeof setInterval>;
-  /** Toggled off by Backspace-after-word; re-armed when a fresh trigger appears. */
-  private disabled = false;
-  private wasTriggered = false;
-
-  constructor(
-    private readonly hostTui: TUI,
-    theme: EditorTheme,
-    keybindings: ConstructorParameters<typeof CustomEditor>[2],
-    private readonly modeState: WorkflowModeState,
-  ) {
-    super(...customEditorConstructorArgs(hostTui, theme, keybindings));
-  }
-
-  /** Highlighted/armed: a trigger is present and the user hasn't toggled it off. */
-  isActive(): boolean {
-    return (
-      this.modeState.keywordTriggerEnabled &&
-      !this.disabled &&
-      hasTrigger(this.getText(), this.modeState.keywordTriggerWord)
-    );
-  }
-
-  override handleInput(data: string): void {
-    // First Backspace right after a trigger word disarms (non-destructive).
-    if (isBackspace(data) && this.isActive() && this.cursorAfterTrigger()) {
-      this.disabled = true;
-      this.modeState.suppressedKeywordText = this.getText().trim();
-      this.syncState();
-      this.hostTui.requestRender();
-      return;
-    }
-    const before = this.getText();
-    super.handleInput(data);
-    const after = this.getText();
-    if (after !== before) {
-      const now = hasTrigger(after, this.modeState.keywordTriggerWord);
-      const normalizedAfter = after.trim();
-      const suppressionCleared =
-        this.modeState.suppressedKeywordText !== undefined &&
-        normalizedAfter !== "" &&
-        normalizedAfter !== this.modeState.suppressedKeywordText;
-      if (suppressionCleared) {
-        this.modeState.suppressedKeywordText = undefined;
-      }
-      // A freshly typed trigger re-arms a previously disabled box.
-      if (now && (!this.wasTriggered || suppressionCleared)) this.disabled = false;
-      this.wasTriggered = now;
-    }
-    this.syncState();
-  }
-
-  override render(width: number): string[] {
-    // Defensive layer for issue #72: on some hosts a base-editor/pi-tui
-    // version mismatch can leave the base `Editor`'s internal render state
-    // uninitialized, making `super.render()` throw on every single render —
-    // including the very first one, before the user has typed anything —
-    // which crashes the whole app at launch with no way to recover (short of
-    // disabling the extension). We can't fix a broken host from here, but we
-    // CAN make sure this extension degrades to a plain, unstyled editor
-    // instead of hard-crashing Pi/OMP.
-    let lines: string[];
-    let usingFallback = false;
-    try {
-      lines = super.render(width);
-    } catch (err) {
-      usingFallback = true;
-      if (!WorkflowEditor.warnedRenderFallback) {
-        WorkflowEditor.warnedRenderFallback = true;
-        console.warn(
-          "[pi-dynamic-workflows] WorkflowEditor: base editor render() threw; degrading to a minimal, unstyled " +
-            "rendering so the app doesn't crash. Workflows-mode highlighting will be unavailable this session. " +
-            `Original error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)} ` +
-            "Please report this at https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72.",
-        );
-      }
-      lines = this.safeFallbackLines(width);
-    }
-
-    // Keep the shared state current even for non-keystroke changes (history
-    // recall, programmatic setText) so the submit hook reads the right value.
-    // Guarded: this bookkeeping must never itself throw — including against
-    // the fallback lines above — or a broken host would still crash the app.
-    try {
-      this.syncState();
-      this.reconcileAnimation();
-    } catch {
-      // Best-effort; rendering must proceed even if bookkeeping fails.
-    }
-
-    let active = false;
-    try {
-      active = this.isActive();
-    } catch {
-      active = false;
-    }
-    if (usingFallback || !active || lines.length === 0) return lines;
-
-    try {
-      // First and last lines are the editor's horizontal borders; only the text
-      // lines in between are colorized.
-      return lines.map((ln, i) =>
-        i === 0 || i === lines.length - 1
-          ? ln
-          : colorizeWorkflow(ln, this.tick, RAINBOW, this.modeState.keywordTriggerWord),
-      );
-    } catch {
-      // Colorizing is cosmetic; never let it turn a working render into a crash.
-      return lines;
-    }
-  }
-
-  /** Emitted at most once per process so a broken host doesn't spam the log every render. */
-  private static warnedRenderFallback = false;
-
-  /**
-   * Minimal, defensive rendering used only when the base editor's render()
-   * throws (see issue #72). Deliberately avoids calling any other overridden
-   * or state-dependent method that might share the same broken internal
-   * state; falls back to an empty array if even plain text access fails.
-   * Not pretty (no borders, no wrapping beyond a hard slice) — the goal is
-   * "the app still launches", not "the editor still looks nice".
-   */
-  private safeFallbackLines(width: number): string[] {
-    try {
-      const text = this.getText();
-      const raw = text.length > 0 ? text.split("\n") : [""];
-      const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 80;
-      return raw.map((line) => (line.length > safeWidth ? line.slice(0, safeWidth) : line));
-    } catch {
-      return [];
-    }
-  }
-
-  /** Absolute text before the cursor, used to detect "right after the word". */
-  private cursorAfterTrigger(): boolean {
-    const lines = this.getLines();
-    const { line, col } = this.getCursor();
-    const before = lines.slice(0, line).join("\n") + (line > 0 ? "\n" : "") + (lines[line] ?? "").slice(0, col);
-    return endsWithTrigger(before, this.modeState.keywordTriggerWord);
-  }
-
-  private syncState(): void {
-    this.modeState.active = this.isActive();
-  }
-
-  private reconcileAnimation(): void {
-    const shouldRun = this.isActive() && this.focused;
-    if (shouldRun && !this.timer) {
-      this.timer = setInterval(() => {
-        this.tick = (this.tick + 1) % (RAINBOW.length * 6);
-        this.hostTui.requestRender();
-      }, 90);
-      // Don't keep the process alive for the animation.
-      (this.timer as { unref?: () => void }).unref?.();
-    } else if (!shouldRun && this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
-  }
-}
-
-/**
- * The directive appended to a submitted message when workflows mode is armed.
- * `extraDirective` (e.g. an effort-tier nudge) is appended when present.
+ * The directive for the explicit `/workflows run <prompt>` command. Unlike the
+ * heuristic {@link buildArmedWorkflowPrompt}, `/workflows run` is a maximal-intent
+ * command — the user typed a command whose whole purpose is to execute a workflow
+ * now — so it does NOT get the "if it's a question, just answer" escape. It still
+ * avoids the old MUST/ONLY forcing language (which caused #88/#89) and still
+ * carries the #89 background/deliver-back reassurance so an ending turn reads as
+ * expected. `extraDirective` (e.g. a standing effort-tier nudge) is appended.
  */
 export function buildForcedWorkflowPrompt(text: string, extraDirective?: string): string {
   const lines = [
     text,
     "",
     "---",
-    "[workflows mode is ON for this message]",
-    "You MUST handle this request by calling the tool named exactly `workflow` (Pi's",
-    "deterministic JavaScript workflow-orchestration tool from pi-dynamic-workflows).",
-    "Write a workflow script that fans the task out across subagents via",
-    "agent()/parallel()/pipeline().",
-    "",
-    "The ONLY acceptable action is a `workflow` tool call. Do NOT instead:",
-    "- answer directly or in prose,",
-    "- call the `subagent` tool yourself,",
-    "- use any skill or command (e.g. pi-subagents, /code-review, deep-research),",
-    '- or interpret the word "workflow/workflows" loosely as some other parallel/audit approach.',
-    "Even for a small task, wrap it in a minimal `workflow` call with at least one agent().",
+    "[/workflows run — you ran an explicit command to execute a workflow for this request.",
+    "Call the `workflow` tool now: write a script that fans this task out across subagents",
+    "via agent()/parallel()/pipeline(). (This is a direct command, not a heuristic guess, so",
+    "do not answer in prose instead of running the workflow.)",
+    BACKGROUND_DELIVERY_REASSURANCE + "]",
   ];
   if (extraDirective) lines.push("", extraDirective);
   return lines.join("\n");
 }
 
-/**
- * Install the workflows-mode editor and the submit-time forcing hook.
- * Call once with the UI context (e.g. in `session_start`).
- */
 /** The exact name of the workflow tool that workflows mode forces. */
 export const WORKFLOW_TOOL_NAME = "workflow";
 
@@ -492,9 +237,9 @@ export function registerWorkflowTriggerCommand(
 }
 
 /**
- * Register the bottom progress-panel preference commands:
+ * Register the bottom progress-panel preference command:
  *  - `/workflows-progress compact|detailed|status` — switch (or report) the panel mode.
- *  - `/workflows-progress-max <1-1000>` — cap agents shown per phase in detailed mode.
+ *  - `/workflows-progress max <1-1000>` — cap agents shown per phase in detailed mode.
  * Both persist via `settingsStore` and take effect on the next live run (the panel
  * live-reads its settings), so no session restart is needed.
  */
@@ -503,57 +248,62 @@ export function registerWorkflowProgressCommands(
   settingsStore: WorkflowSettingsStore = DEFAULT_SETTINGS_STORE,
 ): void {
   pi.registerCommand?.("workflows-progress", {
-    description: "Bottom progress panel: compact | detailed | status",
+    description: "Bottom progress panel: compact | detailed | status | max <N>",
     async handler(args: string, _ctx: ExtensionCommandContext) {
-      const arg = args.trim().toLowerCase();
+      const trimmed = args.trim();
       const say = (content: string) => pi.sendMessage({ customType: "workflows-progress", content, display: true });
-      if (arg === "compact" || arg === "detailed") {
-        const saved = persistProgressSettings(settingsStore, { progressPanelMode: arg });
+      const spaceIdx = trimmed.indexOf(" ");
+      const verb = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+      const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      if (verb === "compact" || verb === "detailed") {
+        const saved = persistProgressSettings(settingsStore, { progressPanelMode: verb });
         await say(
           saved
-            ? `Workflow progress panel set to ${arg} — takes effect on the next render of a live run (no restart needed).`
-            : `Workflow progress panel set to ${arg} for this session, but the preference could not be saved.`,
+            ? `Workflow progress panel set to ${verb} — takes effect on the next render of a live run (no restart needed).`
+            : `Workflow progress panel set to ${verb} for this session, but the preference could not be saved.`,
         );
         return;
       }
-      await say(
-        `Workflow progress panel is ${loadProgressMode(settingsStore)}. Usage: /workflows-progress compact | detailed | status`,
-      );
-    },
-  });
 
-  pi.registerCommand?.("workflows-progress-max", {
-    description: "Max agents shown per phase in detailed progress mode (1-1000)",
-    async handler(args: string, _ctx: ExtensionCommandContext) {
-      const arg = args.trim();
-      const say = (content: string) => pi.sendMessage({ customType: "workflows-progress", content, display: true });
-      if (!arg) {
+      if (verb === "max") {
+        if (!rest) {
+          await say(
+            `Detailed progress shows up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress max <1-1000>`,
+          );
+          return;
+        }
+        const n = Number.parseInt(rest, 10);
+        if (!Number.isFinite(n) || n < 1) {
+          await say(`Invalid value "${rest}". Usage: /workflows-progress max <1-1000> (a whole number ≥ 1).`);
+          return;
+        }
+        const clamped = Math.min(1000, n);
+        const saved = persistProgressSettings(settingsStore, { progressPanelMaxAgents: clamped });
         await say(
-          `Detailed progress shows up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress-max <1-1000>`,
+          saved
+            ? `Detailed progress now shows up to ${clamped} agents per phase.`
+            : `Set to ${clamped} for this session, but the preference could not be saved.`,
         );
         return;
       }
-      const n = Number.parseInt(arg, 10);
-      if (!Number.isFinite(n) || n < 1) {
-        await say(`Invalid value "${arg}". Usage: /workflows-progress-max <1-1000> (a whole number ≥ 1).`);
-        return;
-      }
-      const clamped = Math.min(1000, n);
-      const saved = persistProgressSettings(settingsStore, { progressPanelMaxAgents: clamped });
+
       await say(
-        saved
-          ? `Detailed progress now shows up to ${clamped} agents per phase.`
-          : `Set to ${clamped} for this session, but the preference could not be saved.`,
+        `Workflow progress panel is ${loadProgressMode(settingsStore)}, showing up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress compact | detailed | status | max <N>`,
       );
     },
   });
 }
 
-export function installWorkflowEditor(
+/**
+ * Install the keyword-trigger arming hook (submit-time detection + prompt
+ * rewrite) and the related trigger/progress commands. Call once (e.g. in
+ * `session_start`).
+ */
+export function installWorkflowKeywordArming(
   pi: ExtensionAPI,
-  ui: ExtensionUIContext,
   effort?: EffortState,
-  options: InstallWorkflowEditorOptions = {},
+  options: InstallWorkflowKeywordArmingOptions = {},
 ): WorkflowModeState {
   const settingsStore = options.settingsStore ?? DEFAULT_SETTINGS_STORE;
   const initialSettings = loadInitialWorkflowSettings(settingsStore);
@@ -563,9 +313,6 @@ export function installWorkflowEditor(
     keywordTriggerWord: initialSettings.keywordTriggerWord ?? DEFAULT_KEYWORD_TRIGGER_WORD,
   };
 
-  if (!ui.getEditorComponent?.()) {
-    ui.setEditorComponent((tui, theme, keybindings) => new WorkflowEditor(tui, theme, keybindings, state));
-  }
   registerWorkflowTriggerCommand(pi, state, settingsStore);
   registerWorkflowProgressCommands(pi, settingsStore);
 
@@ -603,10 +350,22 @@ export function installWorkflowEditor(
         pi.setActiveTools?.(current);
       }
     } catch {
-      // Tool restriction is best-effort; the directive still forces the workflow.
+      // Tool restriction is best-effort; the armed directive still authorizes the workflow.
     }
-    const extra = byEffort && effort ? effortDirective(effort.level) : undefined;
-    return { action: "transform", text: buildForcedWorkflowPrompt(event.text, extra) } as const;
+    // Effort path: the trigger word was NOT typed — this arms on ANY substantive
+    // message while standing effort is on. So the directive must (a) state the
+    // truthful "effort" reason (not "the word you typed"), and (b) let the model
+    // skip the workflow entirely on conversational/trivial turns, not just on
+    // questions about workflows.
+    const extra =
+      byEffort && effort
+        ? [effortDirective(effort.level), EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ")
+        : undefined;
+    const reason: ArmReason = byEffort ? "effort" : "keyword";
+    return {
+      action: "transform",
+      text: buildArmedWorkflowPrompt(event.text, { reason, extraDirective: extra }),
+    } as const;
   });
 
   // Restore the user's full tool set once the forced turn completes.

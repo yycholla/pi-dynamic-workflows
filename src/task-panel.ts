@@ -66,8 +66,8 @@ function formatBytes(n: number): string {
 
 /**
  * Pick a clean human-readable summary from a workflow result, in order of
- * preference: a `verdict`/`report`/`summary` string field, a bare string
- * result, else a JSON dump capped at `maxChars`. When the dump is truncated the
+ * preference: a `verdict`/`report`/`summary`/`synthesis` string field, a bare
+ * string result, else a JSON dump capped at `maxChars`. When the dump is truncated the
  * dropped size is reported (the full result is still reachable via the pointer
  * that {@link deliverText} appends).
  */
@@ -76,7 +76,8 @@ function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_M
   if (result == null) return "null";
   if (typeof result === "object") {
     const obj = result as Record<string, unknown>;
-    for (const key of ["verdict", "report", "summary"] as const) {
+    // `synthesis` is what the built-in multi-perspective workflow returns.
+    for (const key of ["verdict", "report", "summary", "synthesis"] as const) {
       const val = obj[key];
       if (typeof val === "string" && val.trim()) return val;
     }
@@ -153,15 +154,22 @@ export function installResultDelivery(
   manager: WorkflowManager,
   opts: { loadSettings?: () => WorkflowSettings } = {},
 ): void {
-  // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
-  const m = manager as unknown as { __deliveryInstalled?: boolean; __holder?: { pi: ExtensionAPI } };
+  // Mutable holder on the manager shared by extension generations across /reload.
+  const m = manager as unknown as {
+    __deliveryInstalled?: boolean;
+    __holder?: { pi: ExtensionAPI; loadSettings?: () => WorkflowSettings };
+  };
   if (m.__deliveryInstalled) {
-    // Refresh pi reference only — listeners stay registered.
-    if (m.__holder) m.__holder.pi = pi;
+    // The manager and listeners survive /reload. Refresh every generation-bound
+    // dependency while leaving listener registration exactly-once.
+    if (m.__holder) {
+      m.__holder.pi = pi;
+      m.__holder.loadSettings = opts.loadSettings;
+    }
     return;
   }
   m.__deliveryInstalled = true;
-  m.__holder = { pi };
+  m.__holder = { pi, loadSettings: opts.loadSettings };
 
   const deliver = (content: string) => {
     try {
@@ -183,7 +191,12 @@ export function installResultDelivery(
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
     if (run?.background) {
-      deliver(deliverText(run, { resultPath: persistedResultPath(manager, runId), maxChars: deliveredMaxChars(opts) }));
+      deliver(
+        deliverText(run, {
+          resultPath: persistedResultPath(manager, runId),
+          maxChars: deliveredMaxChars({ loadSettings: m.__holder?.loadSettings }),
+        }),
+      );
     }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
